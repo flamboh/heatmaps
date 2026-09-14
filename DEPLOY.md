@@ -1,9 +1,9 @@
 # Deployment
 
 Requirements: Bun 1.3+, a Cloudflare Workers Paid account, a
-[Last.fm API key](https://www.last.fm/api/account/create), and a GitHub personal
-access token that can query the GraphQL API. Add `read:user` when private
-contribution totals for the token owner should be included.
+[Last.fm API key](https://www.last.fm/api/account/create). GitHub counts come
+from the public profile calendar and need no token. Private contribution
+counts are included when the profile owner has made them public.
 
 1. Install dependencies:
 
@@ -21,11 +21,10 @@ contribution totals for the token owner should be included.
 3. Replace the existing `account_id` and KV namespace `id` in `wrangler.jsonc`
    with the values for your Cloudflare account.
 
-4. Add both credentials as encrypted secrets:
+4. Add the API key as an encrypted secret:
 
    ```sh
    bunx wrangler secret put LASTFM_API_KEY
-   bunx wrangler secret put GITHUB_TOKEN
    ```
 
 5. Deploy:
@@ -42,4 +41,4 @@ with permission to deploy this Worker. The workflow can also be run manually
 from GitHub's Actions page.
 
 For local development, copy `.dev.vars.example` to `.dev.vars`, add the API
-keys, and run `bun run dev`. Do not commit `.dev.vars`.
+key, and run `bun run dev`. Do not commit `.dev.vars`.

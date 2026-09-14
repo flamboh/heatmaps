@@ -23,12 +23,20 @@ tile grid.
 
 ## How it works
 
-- Last.fm completed scrobbles and GitHub GraphQL `contributionCalendar` days are
-  normalized into the same daily activity snapshot.
+- Last.fm completed scrobbles and GitHub's public profile calendar are
+  normalized into the same daily activity snapshot. GitHub counts keep the
+  dates shown on the profile, including reviews and any private contribution
+  counts the user has chosen to make public.
 - One renderer supplies identical layouts, display modes, SVG/PNG output, and
   source-specific red or green palettes.
 - Source-isolated daily aggregates are stored in Workers KV. Rendered images and
   streak and total responses are cached at the edge for six hours.
+
+GitHub's GraphQL contribution calendar can differ from the profile graph. The
+GitHub loader reads the profile's calendar HTML so images, totals, and streaks
+use the displayed counts. No GitHub token is needed. If GitHub changes that
+markup or omits a requested day, the request fails instead of showing an
+incomplete graph. GitHub caches refresh when the Los Angeles date changes.
 
 See [DEPLOY.md](DEPLOY.md) to deploy your own instance.
 

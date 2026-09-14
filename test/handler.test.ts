@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHandler } from "../src/index";
 import type { Env, ExecutionContextLike } from "../src/types";
+import { githubCalendarResponse } from "./helpers/github";
 
 function testContext(): ExecutionContextLike {
   return { waitUntil: vi.fn() };
@@ -10,9 +11,12 @@ function testEnv(): Env {
   const values = new Map<string, string>();
   return {
     LASTFM_API_KEY: "secret",
-    GITHUB_TOKEN: "github-secret",
     ACTIVITY_CACHE: {
-      get: vi.fn(async (key: string) => values.get(key) ?? null),
+      get: vi.fn(async (key: string, type?: string) => {
+        const value = values.get(key);
+        if (value === undefined) return null;
+        return type === "json" ? JSON.parse(value) : value;
+      }),
       put: vi.fn(async (key: string, value: string) => {
         values.set(key, value);
       }),
@@ -32,6 +36,16 @@ function edgeCache(): Pick<Cache, "match" | "put"> {
       values.set(key, response.clone());
     }),
   };
+}
+
+function githubFetcher(counts: Record<string, number> = {}) {
+  return vi.fn<typeof fetch>().mockImplementation((input) => {
+    const requestUrl = new URL(
+      input instanceof Request ? input.url : String(input),
+    );
+    const year = Number(requestUrl.searchParams.get("to")?.slice(0, 4));
+    return Promise.resolve(githubCalendarResponse(year, counts));
+  });
 }
 
 describe("public handler", () => {
@@ -162,117 +176,83 @@ describe("public handler", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("renders GitHub activity from GraphQL", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(() =>
-      Promise.resolve(
-        Response.json({
-          data: {
-            user: {
-              contributionsCollection: {
-                contributionCalendar: {
-                  weeks: [
-                    {
-                      contributionDays: [
-                        { date: "2026-07-15", contributionCount: 7 },
-                      ],
-                    },
-                  ],
-                },
-              },
-            },
-          },
-        }),
-      ),
+  it("uses the public calendar across GitHub output formats without a token", async () => {
+    const fetcher = githubFetcher({ "2026-09-09": 1 });
+    const cache = edgeCache();
+    const env = testEnv();
+    const rasterize = vi.fn(
+      async (_svg: string) => new Uint8Array([137, 80, 78, 71]),
     );
-    const response = await createHandler({
+    const handle = createHandler({
       fetcher,
-      edgeCache: edgeCache(),
-      now: () => new Date("2026-07-15T12:00:00Z"),
-    })(
+      rasterize,
+      edgeCache: cache,
+      now: () => new Date("2026-09-09T19:00:00Z"),
+    });
+
+    const svg = await handle(
       new Request("https://graph.example/github/octocat.svg"),
-      testEnv(),
+      env,
       testContext(),
     );
-
-    expect(response.status).toBe(200);
-    const body = await response.text();
+    expect(svg.status).toBe(200);
+    const body = await svg.text();
     expect(body).toContain("octocat's GitHub activity");
-    expect(body).toContain('data-date="2026-07-15" data-count="7"');
-    expect(body).toContain(".level-4 { fill: #196127; }");
-  });
+    expect(body).toContain('data-date="2026-09-09" data-count="1"');
 
-  it("returns GitHub streak JSON", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(() =>
-      Promise.resolve(
-        Response.json({
-          data: {
-            user: {
-              contributionsCollection: {
-                contributionCalendar: {
-                  weeks: [
-                    {
-                      contributionDays: [
-                        { date: "2026-07-13", contributionCount: 1 },
-                        { date: "2026-07-14", contributionCount: 2 },
-                        { date: "2026-07-15", contributionCount: 0 },
-                      ],
-                    },
-                  ],
-                },
-              },
-            },
-          },
-        }),
-      ),
-    );
-    const response = await createHandler({
-      fetcher,
-      edgeCache: edgeCache(),
-      now: () => new Date("2026-07-15T12:00:00Z"),
-    })(
-      new Request("https://graph.example/github/octocat/streak"),
-      testEnv(),
+    const total = await handle(
+      new Request("https://graph.example/github/octocat/total"),
+      env,
       testContext(),
     );
+    expect(await total.json()).toEqual({
+      total: 1,
+      from: "2025-09-07",
+      to: "2026-09-09",
+    });
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ streak: 2 });
+    const streak = await handle(
+      new Request("https://graph.example/github/octocat/streak"),
+      env,
+      testContext(),
+    );
+    expect(await streak.json()).toEqual({ streak: 1 });
+
+    const png = await handle(
+      new Request(
+        "https://graph.example/github/octocat.png?theme=dark&display=minimal",
+      ),
+      env,
+      testContext(),
+    );
+    expect(png.headers.get("Content-Type")).toBe("image/png");
+    expect(rasterize.mock.calls[0]?.[0]).toContain(
+      ".level-4 { fill: #39d353; }",
+    );
+    expect(rasterize.mock.calls[0]?.[0]).toContain(
+      'data-date="2026-09-09" data-count="1"',
+    );
+    expect(rasterize.mock.calls[0]?.[0]).toContain('width="686" height="88"');
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("returns GitHub contributions for the exact displayed local range", async () => {
     const context = testContext();
     const cache = edgeCache();
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(() =>
-      Promise.resolve(
-        Response.json({
-          data: {
-            user: {
-              contributionsCollection: {
-                contributionCalendar: {
-                  weeks: [
-                    {
-                      contributionDays: [
-                        { date: "2025-07-12", contributionCount: 100 },
-                        { date: "2025-07-13", contributionCount: 2 },
-                        { date: "2026-07-15", contributionCount: 3 },
-                        { date: "2026-07-16", contributionCount: 200 },
-                      ],
-                    },
-                  ],
-                },
-              },
-            },
-          },
-        }),
-      ),
-    );
+    const fetcher = githubFetcher({
+      "2025-07-12": 100,
+      "2025-07-13": 2,
+      "2026-07-15": 3,
+      "2026-07-16": 200,
+    });
+    const env = testEnv();
     const handle = createHandler({
       fetcher,
       edgeCache: cache,
       now: () => new Date("2026-07-15T23:59:59Z"),
     });
     const request = new Request("https://graph.example/github/octocat/total");
-    const response = await handle(request, testEnv(), context);
+    const response = await handle(request, env, context);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toContain("application/json");
@@ -286,50 +266,55 @@ describe("public handler", () => {
     expect(context.waitUntil).toHaveBeenCalledOnce();
 
     const cachedContext = testContext();
-    const cachedResponse = await handle(request, testEnv(), cachedContext);
+    const cachedResponse = await handle(request, env, cachedContext);
     expect(await cachedResponse.json()).toEqual({
       total: 5,
       from: "2025-07-13",
       to: "2026-07-15",
     });
     expect(cachedContext.waitUntil).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("supports GitHub PNG themes and display modes", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(() =>
-      Promise.resolve(
-        Response.json({
-          data: {
-            user: {
-              contributionsCollection: {
-                contributionCalendar: { weeks: [] },
-              },
-            },
-          },
-        }),
-      ),
-    );
-    const rasterize = vi.fn(
-      async (_svg: string) => new Uint8Array([137, 80, 78, 71]),
-    );
-    const response = await createHandler({
+  it("rolls GitHub edge cache keys at the local midnight", async () => {
+    let now = new Date("2026-09-09T06:59:59Z");
+    const context = testContext();
+    const cache = edgeCache();
+    const env = testEnv();
+    const fetcher = githubFetcher({
+      "2026-09-08": 1,
+      "2026-09-09": 2,
+    });
+    const handle = createHandler({
       fetcher,
-      rasterize,
-      edgeCache: edgeCache(),
-      now: () => new Date("2026-07-15T12:00:00Z"),
-    })(
-      new Request(
-        "https://graph.example/github/octocat.png?theme=dark&display=minimal",
-      ),
-      testEnv(),
-      testContext(),
-    );
+      edgeCache: cache,
+      now: () => now,
+    });
+    const request = new Request("https://graph.example/github/octocat/total");
 
-    expect(response.headers.get("Content-Type")).toBe("image/png");
-    expect(rasterize.mock.calls[0]?.[0]).toContain(
-      ".level-4 { fill: #39d353; }",
-    );
-    expect(rasterize.mock.calls[0]?.[0]).toContain('width="686" height="88"');
+    const beforeMidnight = await handle(request, env, context);
+    expect(await beforeMidnight.json()).toEqual({
+      total: 1,
+      from: "2025-09-07",
+      to: "2026-09-08",
+    });
+
+    const sameDay = await handle(request, env, testContext());
+    expect(await sameDay.json()).toEqual({
+      total: 1,
+      from: "2025-09-07",
+      to: "2026-09-08",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    now = new Date("2026-09-09T07:00:00Z");
+    const afterMidnight = await handle(request, env, testContext());
+    expect(await afterMidnight.json()).toEqual({
+      total: 3,
+      from: "2025-09-07",
+      to: "2026-09-09",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
   it("returns the current local listening streak as JSON", async () => {

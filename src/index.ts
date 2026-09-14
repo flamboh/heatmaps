@@ -1,5 +1,5 @@
 import { GithubError, loadGithubActivity } from "./github";
-import { getCalendarTotal } from "./dates";
+import { getCalendarTotal, toDateKey, unixNow } from "./dates";
 import { loadActivity, LastfmError, streakDays } from "./lastfm";
 import { renderActivitySvg, renderErrorSvg } from "./svg";
 import type { GraphDisplay, GraphTheme } from "./svg";
@@ -26,7 +26,7 @@ const JSON_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "X-Content-Type-Options": "nosniff",
 };
-const CACHE_VERSION = 11;
+const CACHE_VERSION = 12;
 
 type Output =
   | { format: "svg"; display: GraphDisplay }
@@ -80,11 +80,14 @@ export function createHandler(dependencies: HandlerDependencies = {}) {
       );
     }
 
+    const now = dependencies.now?.() ?? new Date();
     const cache =
       dependencies.edgeCache ??
       (caches as CacheStorage & { default: Cache }).default;
+    const dateSegment =
+      source === "github" ? `/${toDateKey(unixNow(now))}` : "";
     const cacheKey = new Request(
-      `${url.origin}/__heatmaps-cache/v${CACHE_VERSION}/${source}/${cachePath(output)}/${encodeURIComponent(username.toLowerCase())}`,
+      `${url.origin}/__heatmaps-cache/v${CACHE_VERSION}/${source}/${cachePath(output)}${dateSegment}/${encodeURIComponent(username.toLowerCase())}`,
     );
     const cachedResponse = await cache.match(cacheKey);
     if (cachedResponse) {
@@ -93,27 +96,23 @@ export function createHandler(dependencies: HandlerDependencies = {}) {
         : cachedResponse;
     }
 
-    const missingSecret =
-      source === "github" ? !env.GITHUB_TOKEN : !env.LASTFM_API_KEY;
+    const missingSecret = source === "lastfm" && !env.LASTFM_API_KEY;
     if (missingSecret) {
-      const secret = source === "github" ? "GITHUB_TOKEN" : "LASTFM_API_KEY";
       return errorResponse(
         source,
         output,
-        `Server is missing ${secret}`,
+        "Server is missing LASTFM_API_KEY",
         500,
         0,
       );
     }
 
     try {
-      const now = dependencies.now?.() ?? new Date();
       const store = kvStore(env.ACTIVITY_CACHE);
       const snapshot =
         source === "github"
           ? await loadGithubActivity({
               username,
-              token: env.GITHUB_TOKEN,
               store,
               fetcher: dependencies.fetcher,
               now,

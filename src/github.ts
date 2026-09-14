@@ -1,28 +1,11 @@
+import { Parser } from "htmlparser2";
 import { addUtcDays, getCalendarRange, toDateKey, unixNow } from "./dates";
 import type { ActivitySnapshot, ActivityStore, ActivityStreak } from "./types";
 
-const API_URL = "https://api.github.com/graphql";
+const CALENDAR_URL = "https://github.com/users";
 const FRESH_FOR_SECONDS = 6 * 60 * 60;
 const MAX_RANGE_DAYS = 365;
 const MAX_STREAK_BACKFILLS = 10;
-
-interface GithubResponse {
-  data?: {
-    user?: {
-      contributionsCollection?: {
-        contributionCalendar?: {
-          weeks?: Array<{
-            contributionDays?: Array<{
-              date?: string;
-              contributionCount?: number;
-            }>;
-          }>;
-        };
-      };
-    } | null;
-  };
-  errors?: Array<{ message?: string }>;
-}
 
 export class GithubError extends Error {
   constructor(
@@ -35,39 +18,64 @@ export class GithubError extends Error {
 
 interface GithubOptions {
   username: string;
-  token: string;
   fetcher: typeof fetch;
 }
 
-export async function loadGithubActivity({
-  username,
-  token,
-  store,
-  fetcher = fetch,
-  now = new Date(),
-  includeStreak = false,
-}: Omit<GithubOptions, "fetcher"> & {
+type YearCache = Map<number, Promise<Record<string, number>>>;
+
+export interface LoadGithubActivityOptions {
+  username: string;
   store: ActivityStore;
   fetcher?: typeof fetch;
   now?: Date;
   includeStreak?: boolean;
-}): Promise<ActivitySnapshot> {
-  const cacheKey = `github:activity:v2:${username.toLowerCase()}`;
+}
+
+export async function loadGithubActivity({
+  username,
+  store,
+  fetcher = fetch,
+  now = new Date(),
+  includeStreak = false,
+}: LoadGithubActivityOptions): Promise<ActivitySnapshot> {
+  const cacheKey = `github:activity:v3:${username.toLowerCase()}`;
   const cached = await store.get(cacheKey);
   const currentUnix = unixNow(now);
-  const fresh = cached && currentUnix - cached.updatedAt < FRESH_FOR_SECONDS;
-  if (fresh && (!includeStreak || cached.streak)) return cached;
+  const sameCalendarDate =
+    cached !== null &&
+    toDateKey(currentUnix) === toDateKey(cached.fetchedThrough);
+  const fresh = Boolean(
+    cached &&
+    currentUnix - cached.updatedAt < FRESH_FOR_SECONDS &&
+    sameCalendarDate,
+  );
+
+  if (fresh && cached && (!includeStreak || cached.streak)) return cached;
 
   const range = getCalendarRange(now);
-  const counts = fresh
-    ? cached.counts
-    : await fetchContributionCounts({
-        username,
-        token,
-        fetcher,
-        from: range.start,
-        to: now,
-      });
+  const yearCache: YearCache = new Map();
+  if (fresh && cached) {
+    const streak = await resolveStreak({
+      counts: cached.counts,
+      rangeStart: dateKey(range.start),
+      previous: cached.streak,
+      username,
+      fetcher,
+      now,
+      yearCache,
+    });
+    const snapshot: ActivitySnapshot = { ...cached, streak };
+    await store.put(cacheKey, snapshot);
+    return snapshot;
+  }
+
+  const counts = await fetchContributionCounts({
+    username,
+    fetcher,
+    from: range.start,
+    to: range.end,
+    yearCache,
+  });
   const snapshot: ActivitySnapshot = {
     username,
     counts,
@@ -76,103 +84,299 @@ export async function loadGithubActivity({
   };
   if (includeStreak || cached?.streak) {
     snapshot.streak = await resolveStreak({
-      username,
-      token,
-      fetcher,
-      now,
       counts,
       rangeStart: dateKey(range.start),
       previous: cached?.streak,
+      username,
+      fetcher,
+      now,
+      yearCache,
     });
   }
   await store.put(cacheKey, snapshot);
   return snapshot;
 }
 
+interface FetchContributionCountsOptions extends GithubOptions {
+  from: Date;
+  to: Date;
+  yearCache?: YearCache;
+}
+
 export async function fetchContributionCounts({
   username,
-  token,
   fetcher,
   from,
   to,
-}: GithubOptions & { from: Date; to: Date }): Promise<Record<string, number>> {
+  yearCache = new Map(),
+}: FetchContributionCountsOptions): Promise<Record<string, number>> {
+  const fromKey = dateKey(from);
+  const toKey = dateKey(to);
+  if (fromKey > toKey) return {};
+
+  const firstYear = Number(fromKey.slice(0, 4));
+  const lastYear = Number(toKey.slice(0, 4));
   const counts: Record<string, number> = {};
-  for (let start = startOfUtcDay(from); start <= to;) {
-    const lastDay = addUtcDays(start, MAX_RANGE_DAYS - 1);
-    const finalWindow = lastDay >= to;
-    const end = finalWindow
-      ? to
-      : new Date(addUtcDays(lastDay, 1).getTime() - 1);
-    Object.assign(
-      counts,
-      await fetchWindow({ username, token, fetcher, from: start, to: end }),
+
+  // GitHub selects a single year even when the URL's date range spans years.
+  for (let year = firstYear; year <= lastYear; year += 1) {
+    const yearCounts = await fetchCalendarYear({
+      username,
+      fetcher,
+      year,
+      yearCache,
+    });
+    const yearStart = `${year}-01-01`;
+    const yearEnd = `${year}-12-31`;
+    const requestedStart = fromKey > yearStart ? fromKey : yearStart;
+    const requestedEnd = toKey < yearEnd ? toKey : yearEnd;
+
+    for (
+      let date = requestedStart;
+      date <= requestedEnd;
+      date = shiftDateKey(date, 1)
+    ) {
+      const count = yearCounts[date];
+      if (count === undefined || !Number.isSafeInteger(count) || count < 0) {
+        throw new GithubError(
+          "GitHub returned an incomplete contribution calendar",
+        );
+      }
+      counts[date] = count;
+    }
+  }
+
+  return counts;
+}
+
+async function fetchCalendarYear({
+  username,
+  fetcher,
+  year,
+  yearCache,
+}: GithubOptions & { year: number; yearCache: YearCache }): Promise<
+  Record<string, number>
+> {
+  const cached = yearCache.get(year);
+  if (cached) return cached;
+
+  const request = fetchCalendarPage({ username, fetcher, year });
+  yearCache.set(year, request);
+  return request;
+}
+
+async function fetchCalendarPage({
+  username,
+  fetcher,
+  year,
+}: GithubOptions & { year: number }): Promise<Record<string, number>> {
+  const url = new URL(
+    `${CALENDAR_URL}/${encodeURIComponent(username)}/contributions`,
+  );
+  url.searchParams.set("from", `${year}-01-01`);
+  url.searchParams.set("to", `${year}-12-31`);
+
+  const response = await fetcher(url, {
+    headers: {
+      Accept: "text/html",
+      "Accept-Language": "en-US",
+      "User-Agent": "heatmaps/0.1 (+https://github.com/flamboh/heatmaps)",
+    },
+  });
+  if (!response.ok) {
+    const status =
+      response.status === 404
+        ? 404
+        : response.status === 403 || response.status === 429
+          ? 429
+          : 502;
+    throw new GithubError(`GitHub request failed (${response.status})`, status);
+  }
+
+  let html: string;
+  try {
+    html = await response.text();
+  } catch {
+    throw new GithubError("GitHub returned an unexpected response");
+  }
+  return parseCalendar(html, year);
+}
+
+interface CalendarCell {
+  date: string;
+  id: string;
+}
+
+interface CalendarTooltip {
+  id: string;
+  text: string;
+  complete: boolean;
+}
+
+function parseCalendar(html: string, year: number): Record<string, number> {
+  const cellsByDate = new Map<string, CalendarCell>();
+  const cellsById = new Map<string, CalendarCell>();
+  const tooltips = new Map<string, CalendarTooltip[]>();
+  let activeCell: CalendarCell | null = null;
+  let activeTooltip: CalendarTooltip | null = null;
+
+  const parser = new Parser(
+    {
+      onopentag(name, attributes) {
+        if (
+          name === "td" &&
+          hasClass(attributes.class, "ContributionCalendar-day")
+        ) {
+          if (activeCell) {
+            throw new GithubError(
+              "GitHub returned malformed contribution calendar markup",
+            );
+          }
+          const date = attributes["data-date"];
+          const id = attributes.id;
+          if (!date || !id) {
+            throw new GithubError(
+              "GitHub returned an invalid contribution calendar cell",
+            );
+          }
+          const cell = { date, id };
+          if (cellsByDate.has(date) || cellsById.has(id)) {
+            throw new GithubError(
+              "GitHub returned duplicate contribution calendar cells",
+            );
+          }
+          activeCell = cell;
+          cellsByDate.set(date, cell);
+          cellsById.set(id, cell);
+        }
+        if (name === "tool-tip") {
+          if (activeTooltip) {
+            throw new GithubError(
+              "GitHub returned malformed contribution tooltip markup",
+            );
+          }
+          const id = attributes.for;
+          if (id) activeTooltip = { id, text: "", complete: true };
+        }
+      },
+      ontext(text) {
+        if (activeTooltip) activeTooltip.text += text;
+      },
+      onclosetag(name, isImplied) {
+        if (name === "td" && activeCell) {
+          if (isImplied)
+            throw new GithubError(
+              "GitHub returned truncated contribution markup",
+            );
+          activeCell = null;
+        }
+        if (name === "tool-tip" && activeTooltip) {
+          const tooltip = activeTooltip;
+          activeTooltip = null;
+          const matching = tooltips.get(tooltip.id) ?? [];
+          matching.push({
+            id: tooltip.id,
+            text: normalizeWhitespace(tooltip.text),
+            complete: !isImplied,
+          });
+          tooltips.set(tooltip.id, matching);
+        }
+      },
+      onerror() {
+        throw new GithubError(
+          "GitHub returned malformed contribution calendar markup",
+        );
+      },
+    },
+    { decodeEntities: true },
+  );
+  try {
+    parser.end(html);
+  } catch (error) {
+    if (error instanceof GithubError) throw error;
+    throw new GithubError(
+      "GitHub returned malformed contribution calendar markup",
     );
-    if (finalWindow) break;
-    start = addUtcDays(lastDay, 1);
+  }
+
+  if (activeCell || activeTooltip) {
+    throw new GithubError(
+      "GitHub returned malformed contribution calendar markup",
+    );
+  }
+
+  const counts: Record<string, number> = {};
+  for (const cell of cellsByDate.values()) {
+    if (!isDateKeyForYear(cell.date, year)) {
+      throw new GithubError("GitHub returned an invalid contribution date");
+    }
+    const matchingTooltips = tooltips.get(cell.id);
+    if (
+      !matchingTooltips ||
+      matchingTooltips.length !== 1 ||
+      !matchingTooltips[0]!.complete
+    ) {
+      throw new GithubError(
+        "GitHub returned an incomplete contribution calendar",
+      );
+    }
+    counts[cell.date] = parseTooltipCount(matchingTooltips[0]!.text);
   }
   return counts;
 }
 
-async function fetchWindow({
-  username,
-  token,
-  fetcher,
-  from,
-  to,
-}: GithubOptions & { from: Date; to: Date }): Promise<Record<string, number>> {
-  const response = await fetcher(API_URL, {
-    method: "POST",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "User-Agent": "heatmaps-worker",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: JSON.stringify({
-      query: `query Contributions($login: String!, $from: DateTime!, $to: DateTime!) {
-        user(login: $login) {
-          contributionsCollection(from: $from, to: $to) {
-            contributionCalendar {
-              weeks { contributionDays { date contributionCount } }
-            }
-          }
-        }
-      }`,
-      variables: {
-        login: username,
-        from: from.toISOString(),
-        to: to.toISOString(),
-      },
-    }),
-  });
-  if (!response.ok) {
-    const status =
-      response.status === 401 ? 500 : response.status === 403 ? 429 : 502;
-    throw new GithubError(`GitHub request failed (${response.status})`, status);
+function hasClass(value: string | undefined, expected: string): boolean {
+  return value?.split(/\s+/u).includes(expected) ?? false;
+}
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+function parseTooltipCount(text: string): number {
+  if (/^No contributions(?: on .+)?\.?$/u.test(text)) return 0;
+
+  const match = /^(\d[\d,]*) (contribution|contributions)(?: on .+)?\.?$/u.exec(
+    text,
+  );
+  if (!match) {
+    throw new GithubError("GitHub returned an invalid contribution tooltip");
   }
 
-  const data = (await response.json()) as GithubResponse;
-  if (data.errors?.length) {
-    const message = data.errors[0]?.message ?? "GitHub request failed";
-    throw new GithubError(message, /rate limit/i.test(message) ? 429 : 502);
+  const rawCount = match[1]!;
+  if (!/^\d+$/u.test(rawCount) && !/^\d{1,3}(?:,\d{3})+$/u.test(rawCount)) {
+    throw new GithubError("GitHub returned an invalid contribution count");
   }
-  if (data.data?.user === null)
-    throw new GithubError("GitHub user not found", 404);
-  const weeks =
-    data.data?.user?.contributionsCollection?.contributionCalendar?.weeks;
-  if (!weeks) throw new GithubError("GitHub returned an unexpected response");
+  const count = Number(rawCount.replaceAll(",", ""));
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new GithubError("GitHub returned an invalid contribution count");
+  }
+  if (
+    (match[2] === "contribution" && count !== 1) ||
+    (match[2] === "contributions" && count === 1)
+  ) {
+    throw new GithubError("GitHub returned an invalid contribution count");
+  }
+  return count;
+}
 
-  const counts: Record<string, number> = {};
-  for (const week of weeks) {
-    for (const day of week.contributionDays ?? []) {
-      if (!day.date || !/^\d{4}-\d{2}-\d{2}$/.test(day.date)) continue;
-      if (!Number.isFinite(day.contributionCount) || day.contributionCount! < 0)
-        continue;
-      counts[day.date] = day.contributionCount!;
-    }
-  }
-  return counts;
+function isDateKeyForYear(value: string, year: number): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (!match || Number(match[1]) !== year) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() + 1 === Number(match[2]) &&
+    date.getUTCDate() === Number(match[3])
+  );
+}
+
+interface ResolveStreakOptions extends GithubOptions {
+  counts: Record<string, number>;
+  rangeStart: string;
+  previous?: ActivityStreak;
+  now: Date;
+  yearCache: YearCache;
 }
 
 async function resolveStreak({
@@ -180,21 +384,17 @@ async function resolveStreak({
   rangeStart,
   previous,
   username,
-  token,
   fetcher,
   now,
-}: GithubOptions & {
-  counts: Record<string, number>;
-  rangeStart: string;
-  previous?: ActivityStreak;
-  now: Date;
-}): Promise<ActivityStreak> {
+  yearCache,
+}: ResolveStreakOptions): Promise<ActivityStreak> {
   const today = toDateKey(unixNow(now));
   const through = counts[today] ? today : shiftDateKey(today, -1);
   const recent = findStreakStart(counts, through, rangeStart);
   if (recent !== undefined) return { start: recent, through };
-  if (previous?.start && previous.start <= rangeStart)
+  if (previous?.start && previous.start <= rangeStart) {
     return { start: previous.start, through };
+  }
 
   let candidateStart = rangeStart;
   for (let attempt = 0; attempt < MAX_STREAK_BACKFILLS; attempt += 1) {
@@ -202,10 +402,10 @@ async function resolveStreak({
     const windowStart = shiftDateKey(windowEnd, -(MAX_RANGE_DAYS - 1));
     const older = await fetchContributionCounts({
       username,
-      token,
       fetcher,
       from: dateFromKey(windowStart),
       to: new Date(addUtcDays(dateFromKey(windowEnd), 1).getTime() - 1),
+      yearCache,
     });
     const start = findStreakStart(older, windowEnd, windowStart);
     if (start !== undefined) return { start, through };
@@ -223,12 +423,6 @@ function findStreakStart(
     if (!counts[date]) return date === through ? null : shiftDateKey(date, 1);
   }
   return undefined;
-}
-
-function startOfUtcDay(date: Date): Date {
-  return new Date(
-    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-  );
 }
 
 function dateKey(value: Date): string {

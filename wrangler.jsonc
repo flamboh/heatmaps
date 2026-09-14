@@ -30,6 +30,6 @@
     },
   ],
   "secrets": {
-    "required": ["LASTFM_API_KEY", "GITHUB_TOKEN"],
+    "required": ["LASTFM_API_KEY"],
   },
 }
