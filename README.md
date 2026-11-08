@@ -6,10 +6,13 @@ Embeddable, matching GitHub-style activity graphs for Last.fm and GitHub.
 <img src="https://heat.oli.boo/lastfm/YOUR_USERNAME" alt="Last.fm activity" />
 <img src="https://heat.oli.boo/github/YOUR_USERNAME" alt="GitHub activity" />
 ```
+
 ## Last.FM (https://heat.oli.boo/lastfm/flamboh?display=minimal)
-<img src="https://heat.oli.boo/lastfm/flamboh?display=minimal" alt="GitHub activity" />
+
+<img src="https://heat.oli.boo/lastfm/flamboh?display=minimal" alt="Last.fm activity" />
 
 ## GitHub (https://heat.oli.boo/github/flamboh?display=minimal)
+
 <img src="https://heat.oli.boo/github/flamboh?display=minimal" alt="GitHub activity" />
 
 Both sources expose the same interface:
